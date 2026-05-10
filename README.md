@@ -1,8 +1,8 @@
 # 📺 HLS Manifest Viewer
 
-A browser-based tool to analyze HLS `.m3u8` manifests visually. No server required — runs entirely in the browser.
+A browser-based HLS manifest (.m3u8) analyzer — inspect variants, audio tracks, subtitles, segments, codecs, encryption, and more with a modern visual UI. Zero dependencies, no build step.
 
-**[Live Demo →](#)** *(update with your GitHub Pages URL)*
+**[Live Demo →](https://alsameema.github.io/HLS_Manifest_Analyser/)** 
 
 ## Features
 
