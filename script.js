@@ -97,6 +97,238 @@ function isValidUrl(str) {
   }
 }
 
+// ============================
+// DRM / PSSH DECODERS
+// ============================
+
+function identifyDRM(keyformat) {
+  if (!keyformat) return { name: "AES-128", system: "aes-128" };
+  const kf = keyformat.toLowerCase();
+  if (kf === "identity") return { name: "AES-128 (Clear Key)", system: "aes-128" };
+  if (kf.includes("edef8ba9-79d6-4ace-a3c8-27dcd51d21ed")) return { name: "Widevine", system: "widevine" };
+  if (kf.includes("9a04f079-9840-4286-ab92-e65be0885f95")) return { name: "PlayReady", system: "playready" };
+  if (kf === "com.apple.streamingkeydelivery") return { name: "FairPlay", system: "fairplay" };
+  if (kf === "com.microsoft.playready") return { name: "PlayReady", system: "playready" };
+  if (kf.includes("clearkey")) return { name: "ClearKey", system: "clearkey" };
+  return { name: keyformat, system: "unknown" };
+}
+
+function formatUUID(bytes) {
+  const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+  return hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20);
+}
+
+function formatPlayReadyGUID(bytes) {
+  if (bytes.length < 16) return formatUUID(bytes);
+  const swap = new Uint8Array(16);
+  swap[0] = bytes[3]; swap[1] = bytes[2]; swap[2] = bytes[1]; swap[3] = bytes[0];
+  swap[4] = bytes[5]; swap[5] = bytes[4];
+  swap[6] = bytes[7]; swap[7] = bytes[6];
+  for (let i = 8; i < 16; i++) swap[i] = bytes[i];
+  return formatUUID(swap);
+}
+
+function readVarint(data, offset) {
+  let value = 0;
+  let shift = 0;
+  while (offset < data.length) {
+    const byte = data[offset];
+    offset++;
+    value |= (byte & 0x7F) << shift;
+    if ((byte & 0x80) === 0) return { value, offset };
+    shift += 7;
+    if (shift > 35) return null;
+  }
+  return null;
+}
+
+function decodePSSH(base64String) {
+  try {
+    const binaryStr = atob(base64String);
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+
+    if (bytes.length < 32) return { error: "Too short to be a valid PSSH box" };
+
+    const type = String.fromCharCode(bytes[4], bytes[5], bytes[6], bytes[7]);
+    if (type !== 'pssh') return { error: "Not a PSSH box (type: " + type + ")" };
+
+    const version = bytes[8];
+    const systemId = formatUUID(bytes.slice(12, 28));
+
+    let offset = 28;
+    const keyIds = [];
+
+    if (version >= 1 && offset + 4 <= bytes.length) {
+      const keyIdCount = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
+      offset += 4;
+      for (let i = 0; i < keyIdCount && offset + 16 <= bytes.length; i++) {
+        keyIds.push(formatUUID(bytes.slice(offset, offset + 16)));
+        offset += 16;
+      }
+    }
+
+    let dataSize = 0;
+    let data = null;
+    if (offset + 4 <= bytes.length) {
+      dataSize = (bytes[offset] << 24) | (bytes[offset + 1] << 16) | (bytes[offset + 2] << 8) | bytes[offset + 3];
+      offset += 4;
+      if (dataSize > 0 && offset + dataSize <= bytes.length) {
+        data = bytes.slice(offset, offset + dataSize);
+      }
+    }
+
+    const drmNames = {
+      "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed": "Widevine",
+      "9a04f079-9840-4286-ab92-e65be0885f95": "PlayReady",
+      "94ce86fb-07ff-4f43-adb8-93d2fa968ca2": "FairPlay",
+      "1077efec-c0b2-4d02-ace3-3c1e52e2fb4b": "W3C Common (ClearKey)",
+      "e2719d58-a985-b3c9-781a-b030af78d30e": "ClearKey"
+    };
+
+    const result = { version, systemId, keyIds, dataSize, drmName: drmNames[systemId] || "Unknown" };
+
+    if (data) {
+      if (systemId === "9a04f079-9840-4286-ab92-e65be0885f95") {
+        result.playreadyData = decodePlayReadyObject(data);
+      }
+      if (systemId === "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed") {
+        result.widevineData = decodeWidevineInitData(data);
+      }
+    }
+
+    return result;
+  } catch (e) {
+    return { error: "Failed to decode PSSH: " + e.message };
+  }
+}
+
+function decodePlayReadyObject(data) {
+  try {
+    const result = {};
+    const recordCount = data[4] | (data[5] << 8);
+    let offset = 6;
+
+    for (let i = 0; i < recordCount && offset + 4 <= data.length; i++) {
+      const recordType = data[offset] | (data[offset + 1] << 8);
+      const recordLen = data[offset + 2] | (data[offset + 3] << 8);
+      offset += 4;
+
+      if (recordType === 1 && recordLen > 0 && offset + recordLen <= data.length) {
+        const xmlBytes = data.slice(offset, offset + recordLen);
+        let xml = '';
+        for (let j = 0; j < xmlBytes.length - 1; j += 2) {
+          xml += String.fromCharCode(xmlBytes[j] | (xmlBytes[j + 1] << 8));
+        }
+        result.headerXml = xml;
+
+        const laMatch = xml.match(/<LA_URL>(.*?)<\/LA_URL>/i);
+        if (laMatch) result.laUrl = laMatch[1];
+
+        const kidMatches = xml.match(/KID="([^"]+)"/gi);
+        if (kidMatches) {
+          result.keyIds = kidMatches.map(m => {
+            const kid = m.match(/KID="([^"]+)"/i)[1];
+            try {
+              const kidBytes = atob(kid);
+              const arr = new Uint8Array(kidBytes.length);
+              for (let k = 0; k < kidBytes.length; k++) arr[k] = kidBytes.charCodeAt(k);
+              return formatPlayReadyGUID(arr);
+            } catch { return kid; }
+          });
+        }
+
+        const algMatch = xml.match(/<ALGID>(.*?)<\/ALGID>/i);
+        if (algMatch) result.algorithm = algMatch[1];
+
+        const checkMatch = xml.match(/<CHECKSUM>(.*?)<\/CHECKSUM>/i);
+        if (checkMatch) result.checksum = checkMatch[1];
+      }
+
+      offset += recordLen;
+    }
+
+    return result;
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+function decodeWidevineInitData(data) {
+  try {
+    const result = { keyIds: [], provider: '', contentId: '' };
+    let offset = 0;
+
+    while (offset < data.length) {
+      const tag = readVarint(data, offset);
+      if (!tag) break;
+      offset = tag.offset;
+      const fieldNumber = tag.value >> 3;
+      const wireType = tag.value & 0x7;
+
+      if (wireType === 0) {
+        const val = readVarint(data, offset);
+        if (!val) break;
+        offset = val.offset;
+        if (fieldNumber === 1) result.algorithm = val.value;
+        if (fieldNumber === 8) {
+          const s = val.value;
+          result.protectionScheme = String.fromCharCode((s >> 24) & 0xFF, (s >> 16) & 0xFF, (s >> 8) & 0xFF, s & 0xFF);
+        }
+      } else if (wireType === 2) {
+        const len = readVarint(data, offset);
+        if (!len) break;
+        offset = len.offset;
+        const fieldData = data.slice(offset, offset + len.value);
+        offset += len.value;
+
+        if (fieldNumber === 2) {
+          const hex = Array.from(fieldData).map(b => b.toString(16).padStart(2, '0')).join('');
+          if (hex.length === 32) {
+            result.keyIds.push(hex.slice(0, 8) + '-' + hex.slice(8, 12) + '-' + hex.slice(12, 16) + '-' + hex.slice(16, 20) + '-' + hex.slice(20));
+          } else {
+            result.keyIds.push(hex);
+          }
+        } else if (fieldNumber === 3) {
+          result.provider = new TextDecoder().decode(fieldData);
+        } else if (fieldNumber === 4) {
+          try {
+            result.contentId = new TextDecoder('utf-8', { fatal: true }).decode(fieldData);
+          } catch {
+            result.contentId = Array.from(fieldData).map(b => b.toString(16).padStart(2, '0')).join('');
+          }
+        }
+      } else {
+        break;
+      }
+    }
+
+    return result;
+  } catch (e) {
+    return { error: e.message };
+  }
+}
+
+function tryDecodePSSHFromURI(uri) {
+  if (!uri) return null;
+  // Widevine/PlayReady URIs in HLS often use data: or base64 PSSH
+  // Format: data:text/plain;base64,AAAA... or just base64
+  let base64 = null;
+  if (uri.startsWith("data:")) {
+    const match = uri.match(/base64,(.+)/);
+    if (match) base64 = match[1];
+  } else if (uri.match(/^[A-Za-z0-9+/=]{20,}$/)) {
+    base64 = uri;
+  }
+  if (!base64) return null;
+  const decoded = decodePSSH(base64);
+  if (decoded && !decoded.error) {
+    decoded._rawBase64 = base64;
+    return decoded;
+  }
+  return null;
+}
+
 function getHttpErrorMessage(status, statusText) {
   const errors = {
     400: "400 Bad Request — The server could not understand the request. The URL may be malformed.",
@@ -300,6 +532,7 @@ function parseManifest(manifest, baseUrl) {
     ccTracks: [],
     closedCaptionsAttr: null,
     encryption: null,
+    encryptionEntries: [],   // all EXT-X-KEY / EXT-X-SESSION-KEY entries
     discontinuities: 0,
     hasEndList: false,
     streamType: null, // live, vod, event
@@ -317,6 +550,13 @@ function parseManifest(manifest, baseUrl) {
     byteRanges: [],          // #EXT-X-BYTERANGE entries
     startOffset: null,       // #EXT-X-START
     independentSegments: false,
+    // Low-Latency HLS (LL-HLS)
+    serverControl: null,     // #EXT-X-SERVER-CONTROL
+    partInf: null,           // #EXT-X-PART-INF
+    parts: [],               // #EXT-X-PART entries
+    preloadHints: [],        // #EXT-X-PRELOAD-HINT entries
+    skip: null,              // #EXT-X-SKIP
+    isLowLatency: false,
     warnings: []
   };
 
@@ -360,14 +600,37 @@ function parseManifest(manifest, baseUrl) {
     }
 
     // ENCRYPTION
-    if (line.startsWith("#EXT-X-KEY:")) {
+    if (line.startsWith("#EXT-X-KEY:") || line.startsWith("#EXT-X-SESSION-KEY:")) {
+      const isSession = line.startsWith("#EXT-X-SESSION-KEY:");
       const methodMatch = line.match(/METHOD=([^,]+)/);
       if (methodMatch && methodMatch[1] !== "NONE") {
         const uriMatch = line.match(/URI="([^"]+)"/);
-        result.encryption = {
+        const keyformatMatch = line.match(/KEYFORMAT="([^"]+)"/);
+        const keyformatVersionsMatch = line.match(/KEYFORMATVERSIONS="([^"]+)"/);
+        const ivMatch = line.match(/IV=0x([0-9a-fA-F]+)/);
+
+        const entry = {
           method: methodMatch[1],
-          uri: uriMatch ? uriMatch[1] : null
+          uri: uriMatch ? uriMatch[1] : null,
+          keyformat: keyformatMatch ? keyformatMatch[1] : null,
+          keyformatVersions: keyformatVersionsMatch ? keyformatVersionsMatch[1] : null,
+          iv: ivMatch ? ivMatch[1] : null,
+          isSessionKey: isSession,
+          drm: identifyDRM(keyformatMatch ? keyformatMatch[1] : null),
+          psshDecoded: null
         };
+
+        // Try to decode PSSH from URI (Widevine/PlayReady use base64 PSSH in URI)
+        if (entry.uri) {
+          entry.psshDecoded = tryDecodePSSHFromURI(entry.uri);
+        }
+
+        result.encryptionEntries.push(entry);
+
+        // Keep backward compat — set first encryption entry
+        if (!result.encryption) {
+          result.encryption = entry;
+        }
       }
     }
 
@@ -544,6 +807,74 @@ function parseManifest(manifest, baseUrl) {
     // INDEPENDENT-SEGMENTS
     if (line === "#EXT-X-INDEPENDENT-SEGMENTS") {
       result.independentSegments = true;
+    }
+
+    // LL-HLS: EXT-X-SERVER-CONTROL
+    if (line.startsWith("#EXT-X-SERVER-CONTROL:")) {
+      const sc = {};
+      const canBlock = line.match(/CAN-BLOCK-RELOAD=(YES|NO)/);
+      const canSkip = line.match(/CAN-SKIP-UNTIL=([\d.]+)/);
+      const canSkipDR = line.match(/CAN-SKIP-DATERANGES=(YES|NO)/);
+      const holdBack = line.match(/HOLD-BACK=([\d.]+)/);
+      const partHoldBack = line.match(/PART-HOLD-BACK=([\d.]+)/);
+      if (canBlock) sc.canBlockReload = canBlock[1] === "YES";
+      if (canSkip) sc.canSkipUntil = parseFloat(canSkip[1]);
+      if (canSkipDR) sc.canSkipDateranges = canSkipDR[1] === "YES";
+      if (holdBack) sc.holdBack = parseFloat(holdBack[1]);
+      if (partHoldBack) sc.partHoldBack = parseFloat(partHoldBack[1]);
+      result.serverControl = sc;
+      result.isLowLatency = true;
+    }
+
+    // LL-HLS: EXT-X-PART-INF
+    if (line.startsWith("#EXT-X-PART-INF:")) {
+      const ptMatch = line.match(/PART-TARGET=([\d.]+)/);
+      result.partInf = { partTarget: ptMatch ? parseFloat(ptMatch[1]) : null };
+      result.isLowLatency = true;
+    }
+
+    // LL-HLS: EXT-X-PART
+    if (line.startsWith("#EXT-X-PART:")) {
+      const part = {};
+      const durMatch = line.match(/DURATION=([\d.]+)/);
+      const uriMatch = line.match(/URI="([^"]+)"/);
+      const indMatch = line.match(/INDEPENDENT=(YES|NO)/);
+      const gapMatch = line.match(/GAP=(YES|NO)/);
+      const brMatch = line.match(/BYTERANGE="([^"]+)"/);
+      if (durMatch) part.duration = parseFloat(durMatch[1]);
+      if (uriMatch) part.uri = resolveUrl(baseUrl, uriMatch[1]);
+      if (uriMatch) part.rawUri = uriMatch[1];
+      if (indMatch) part.independent = indMatch[1] === "YES";
+      if (gapMatch) part.gap = gapMatch[1] === "YES";
+      if (brMatch) part.byteRange = brMatch[1];
+      result.parts.push(part);
+      result.isLowLatency = true;
+    }
+
+    // LL-HLS: EXT-X-PRELOAD-HINT
+    if (line.startsWith("#EXT-X-PRELOAD-HINT:")) {
+      const hint = {};
+      const typeMatch = line.match(/TYPE=([^,]+)/);
+      const uriMatch = line.match(/URI="([^"]+)"/);
+      const startMatch = line.match(/BYTERANGE-START=(\d+)/);
+      const lenMatch = line.match(/BYTERANGE-LENGTH=(\d+)/);
+      if (typeMatch) hint.type = typeMatch[1];
+      if (uriMatch) hint.uri = resolveUrl(baseUrl, uriMatch[1]);
+      if (uriMatch) hint.rawUri = uriMatch[1];
+      if (startMatch) hint.byterangeStart = parseInt(startMatch[1]);
+      if (lenMatch) hint.byterangeLength = parseInt(lenMatch[1]);
+      result.preloadHints.push(hint);
+      result.isLowLatency = true;
+    }
+
+    // LL-HLS: EXT-X-SKIP
+    if (line.startsWith("#EXT-X-SKIP:")) {
+      const skipped = line.match(/SKIPPED-SEGMENTS=(\d+)/);
+      const removedDR = line.match(/RECENTLY-REMOVED-DATERANGES="([^"]+)"/);
+      result.skip = {
+        skippedSegments: skipped ? parseInt(skipped[1]) : 0,
+        recentlyRemovedDateranges: removedDR ? removedDR[1] : null
+      };
     }
 
     // EXTINF (segment duration)
@@ -726,13 +1057,18 @@ function drawDurationChart(canvas, durations, targetDuration) {
 // RAW MANIFEST RENDERER
 // ============================
 
-function renderRawManifest(manifest) {
+function renderRawManifest(manifest, preserveState) {
   const viewer = document.getElementById("rawViewer");
   const content = document.getElementById("rawContent");
   viewer.style.display = "block";
-  rawCollapsed = true;
-  content.style.display = "none";
-  document.getElementById("toggleRawBtn").textContent = "▶";
+  if (!preserveState) {
+    rawCollapsed = true;
+    content.style.display = "none";
+    document.getElementById("toggleRawBtn").textContent = "▶";
+  } else {
+    content.style.display = rawCollapsed ? "none" : "block";
+    document.getElementById("toggleRawBtn").textContent = rawCollapsed ? "▶" : "▼";
+  }
 
   const lines = manifest.split(/\r?\n/);
   content.innerHTML = "";
@@ -765,6 +1101,9 @@ function renderRawManifest(manifest) {
 // COLLAPSIBLE SECTION HELPER
 // ============================
 
+// Track section expand/collapse states across re-renders
+const _expandedSections = {};
+
 function createCollapsibleSection(titleText, count, startCollapsed) {
   const section = document.createElement("div");
   section.className = "media-tracks collapsible-section";
@@ -774,11 +1113,14 @@ function createCollapsibleSection(titleText, count, startCollapsed) {
 
   const arrow = document.createElement("span");
   arrow.className = "section-arrow";
-  arrow.textContent = startCollapsed ? "▶" : "▼";
-  header.appendChild(arrow);
 
   const title = document.createElement("h2");
   title.textContent = titleText;
+
+  // Use saved state if available, otherwise use default
+  let collapsed = (titleText in _expandedSections) ? !_expandedSections[titleText] : startCollapsed;
+  arrow.textContent = collapsed ? "▶" : "▼";
+  header.appendChild(arrow);
   header.appendChild(title);
 
   if (count !== undefined && count !== null) {
@@ -792,13 +1134,14 @@ function createCollapsibleSection(titleText, count, startCollapsed) {
 
   const body = document.createElement("div");
   body.className = "section-body";
-  if (startCollapsed) body.style.display = "none";
+  if (collapsed) body.style.display = "none";
   section.appendChild(body);
 
   header.addEventListener("click", () => {
-    const collapsed = body.style.display === "none";
-    body.style.display = collapsed ? "block" : "none";
-    arrow.textContent = collapsed ? "▼" : "▶";
+    const isCollapsed = body.style.display === "none";
+    body.style.display = isCollapsed ? "block" : "none";
+    arrow.textContent = isCollapsed ? "▼" : "▶";
+    _expandedSections[titleText] = isCollapsed; // true = now expanded
   });
 
   return { section, body };
@@ -1062,6 +1405,9 @@ function renderResults(data) {
   if (data.encryption) {
     typeLabel += ` <span class="badge badge-encrypted">🔒 ${escapeHtml(data.encryption.method)}</span>`;
   }
+  if (data.isLowLatency) {
+    typeLabel += ' <span class="badge badge-ll">⚡ LL-HLS</span>';
+  }
 
   appendStat(outputEl, "Playlist Type", typeLabel, true);
 
@@ -1277,8 +1623,214 @@ function renderResults(data) {
       outputEl.appendChild(dGrid);
     }
 
-    // Encryption info
-    if (data.encryption) {
+    // Encryption / DRM info
+    if (data.encryptionEntries.length > 0) {
+      const { section, body } = createCollapsibleSection(
+        "Encryption / DRM", data.encryptionEntries.length, false
+      );
+
+      data.encryptionEntries.forEach(entry => {
+        const item = document.createElement("div");
+        item.className = "track-item";
+
+        const typeBadge = document.createElement("span");
+        typeBadge.className = "track-type track-type-drm";
+        typeBadge.textContent = entry.drm.name;
+        item.appendChild(typeBadge);
+
+        if (entry.isSessionKey) {
+          const sessionBadge = document.createElement("span");
+          sessionBadge.className = "track-type";
+          sessionBadge.style.marginLeft = "4px";
+          sessionBadge.textContent = "SESSION";
+          item.appendChild(sessionBadge);
+        }
+
+        const nameSpan = document.createElement("span");
+        nameSpan.className = "track-name";
+        nameSpan.textContent = entry.method;
+        item.appendChild(nameSpan);
+
+        const details = [];
+        if (entry.keyformat) details.push("KeyFormat: " + entry.keyformat);
+        if (entry.keyformatVersions) details.push("Versions: " + entry.keyformatVersions);
+        if (entry.iv) details.push("IV: 0x" + entry.iv);
+        if (entry.uri && !entry.psshDecoded) details.push("URI: " + entry.uri);
+
+        if (details.length > 0) {
+          const detailDiv = document.createElement("div");
+          detailDiv.className = "track-details";
+          detailDiv.textContent = details.join(" · ");
+          item.appendChild(detailDiv);
+        }
+
+        // Key URI with copy button
+        if (entry.uri) {
+          const uriRow = document.createElement("div");
+          uriRow.className = "track-details";
+          uriRow.style.display = "flex";
+          uriRow.style.alignItems = "center";
+          uriRow.style.gap = "8px";
+          uriRow.style.marginTop = "6px";
+          const uriLabel = document.createElement("span");
+          uriLabel.style.fontWeight = "600";
+          uriLabel.style.flexShrink = "0";
+          uriLabel.textContent = "Key URI:";
+          uriRow.appendChild(uriLabel);
+          const uriVal = document.createElement("span");
+          uriVal.style.flex = "1";
+          uriVal.style.wordBreak = "break-all";
+          uriVal.style.fontFamily = "'JetBrains Mono', monospace";
+          uriVal.style.fontSize = "11px";
+          uriVal.textContent = entry.uri;
+          uriRow.appendChild(uriVal);
+          const copyBtn = document.createElement("button");
+          copyBtn.className = "table-copy-btn";
+          copyBtn.textContent = "📋";
+          copyBtn.title = "Copy Key URI";
+          copyBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            navigator.clipboard.writeText(entry.uri).then(() => {
+              copyBtn.textContent = "✓";
+              setTimeout(() => { copyBtn.textContent = "📋"; }, 1200);
+            });
+          });
+          uriRow.appendChild(copyBtn);
+          item.appendChild(uriRow);
+        }
+
+        // Decoded PSSH panel
+        if (entry.psshDecoded && !entry.psshDecoded.error) {
+          const decoded = entry.psshDecoded;
+          const decodeToggle = document.createElement("button");
+          decodeToggle.className = "decode-toggle-btn";
+          decodeToggle.textContent = "🔓 Decode PSSH";
+          item.appendChild(decodeToggle);
+
+          const decodeBody = document.createElement("div");
+          decodeBody.className = "decoded-pssh-body";
+          decodeBody.style.display = "none";
+
+          const rows = [];
+          rows.push(["PSSH Version", "v" + decoded.version]);
+          rows.push(["System ID", decoded.systemId + " (" + decoded.drmName + ")"]);
+          rows.push(["Data Size", decoded.dataSize + " bytes"]);
+
+          if (decoded.keyIds.length > 0) {
+            rows.push(["Key IDs (" + decoded.keyIds.length + ")", decoded.keyIds.join("\n")]);
+          }
+
+          if (decoded.playreadyData) {
+            const pr = decoded.playreadyData;
+            if (pr.laUrl) rows.push(["PlayReady License URL", pr.laUrl]);
+            if (pr.algorithm) rows.push(["Algorithm", pr.algorithm]);
+            if (pr.keyIds && pr.keyIds.length > 0) rows.push(["PlayReady Key IDs", pr.keyIds.join("\n")]);
+            if (pr.checksum) rows.push(["Checksum", pr.checksum]);
+            if (pr.headerXml) {
+              const xmlBtn = document.createElement("button");
+              xmlBtn.className = "decode-toggle-btn decode-xml-btn";
+              xmlBtn.textContent = "📄 Show PlayReady Header XML";
+              const xmlPre = document.createElement("pre");
+              xmlPre.className = "decoded-xml";
+              xmlPre.style.display = "none";
+              xmlPre.textContent = pr.headerXml.replace(/></g, '>\n<');
+              xmlBtn.addEventListener("click", () => {
+                const showing = xmlPre.style.display !== "none";
+                xmlPre.style.display = showing ? "none" : "block";
+                xmlBtn.textContent = showing ? "📄 Show PlayReady Header XML" : "📄 Hide PlayReady Header XML";
+              });
+              decodeBody.appendChild(xmlBtn);
+              decodeBody.appendChild(xmlPre);
+            }
+          }
+
+          if (decoded.widevineData) {
+            const wv = decoded.widevineData;
+            if (wv.provider) rows.push(["Widevine Provider", wv.provider]);
+            if (wv.contentId) rows.push(["Content ID", wv.contentId]);
+            if (wv.protectionScheme) rows.push(["Protection Scheme", wv.protectionScheme]);
+            if (wv.keyIds && wv.keyIds.length > 0) rows.push(["Widevine Key IDs", wv.keyIds.join("\n")]);
+          }
+
+          const table = document.createElement("table");
+          table.className = "decoded-table";
+          rows.forEach(([label, value]) => {
+            const tr = document.createElement("tr");
+            const tdLabel = document.createElement("td");
+            tdLabel.className = "decoded-label";
+            tdLabel.textContent = label;
+            tr.appendChild(tdLabel);
+            const tdValue = document.createElement("td");
+            tdValue.className = "decoded-value";
+
+            if (label.includes("Key ID") || label === "System ID" || label.includes("License URL") || label === "Content ID") {
+              const wrap = document.createElement("div");
+              wrap.style.display = "flex";
+              wrap.style.alignItems = "flex-start";
+              wrap.style.gap = "8px";
+              const valSpan = document.createElement("span");
+              valSpan.textContent = value;
+              valSpan.style.flex = "1";
+              wrap.appendChild(valSpan);
+              const cpBtn = document.createElement("button");
+              cpBtn.className = "table-copy-btn";
+              cpBtn.textContent = "📋";
+              cpBtn.title = "Copy " + label;
+              cpBtn.addEventListener("click", (ev) => {
+                ev.stopPropagation();
+                navigator.clipboard.writeText(value).then(() => {
+                  cpBtn.textContent = "✓";
+                  setTimeout(() => { cpBtn.textContent = "📋"; }, 1200);
+                });
+              });
+              wrap.appendChild(cpBtn);
+              tdValue.appendChild(wrap);
+            } else {
+              tdValue.textContent = value;
+            }
+
+            tr.appendChild(tdValue);
+            table.appendChild(tr);
+          });
+
+          decodeBody.insertBefore(table, decodeBody.firstChild);
+
+          // Raw PSSH base64
+          if (decoded._rawBase64) {
+            const rawBtn = document.createElement("button");
+            rawBtn.className = "decode-toggle-btn decode-xml-btn";
+            rawBtn.textContent = "🔑 Show Raw PSSH (Base64)";
+            const rawPre = document.createElement("pre");
+            rawPre.className = "decoded-xml";
+            rawPre.style.display = "none";
+            rawPre.textContent = decoded._rawBase64;
+            rawBtn.addEventListener("click", () => {
+              const showing = rawPre.style.display !== "none";
+              rawPre.style.display = showing ? "none" : "block";
+              rawBtn.textContent = showing ? "🔑 Show Raw PSSH (Base64)" : "🔑 Hide Raw PSSH (Base64)";
+            });
+            decodeBody.appendChild(rawBtn);
+            decodeBody.appendChild(rawPre);
+          }
+
+          const decodePanel = document.createElement("div");
+          decodePanel.className = "decoded-pssh-panel";
+          decodePanel.appendChild(decodeBody);
+          item.appendChild(decodePanel);
+
+          decodeToggle.addEventListener("click", () => {
+            const showing = decodeBody.style.display !== "none";
+            decodeBody.style.display = showing ? "none" : "block";
+            decodeToggle.textContent = showing ? "🔓 Decode PSSH" : "🔒 Hide Decoded PSSH";
+          });
+        }
+
+        body.appendChild(item);
+      });
+
+      outputEl.appendChild(section);
+    } else if (data.encryption) {
+      // Fallback for simple encryption without parsed entries
       appendStat(outputEl, "Encryption", escapeHtml(data.encryption.method) +
         (data.encryption.uri ? " — Key URI: " + escapeHtml(data.encryption.uri) : ""));
     }
@@ -1400,6 +1952,179 @@ function renderResults(data) {
   // Byte Ranges
   if (data.byteRanges.length > 0) {
     appendStat(outputEl, "Byte-Range Segments", data.byteRanges.length + " segment(s) use byte-range addressing");
+  }
+
+  // Low-Latency HLS (LL-HLS)
+  if (data.isLowLatency || data.serverControl || data.partInf || data.parts.length > 0 || data.preloadHints.length > 0) {
+    const { section, body } = createCollapsibleSection(
+      "Low-Latency HLS (LL-HLS)", null, false
+    );
+    section.classList.add("ll-hls-section");
+
+    // LL-HLS badge on the type label
+    const llBadge = document.createElement("span");
+    llBadge.className = "badge badge-ll";
+    llBadge.textContent = "⚡ Low-Latency";
+    section.querySelector(".section-header").appendChild(llBadge);
+
+    // Server Control
+    if (data.serverControl) {
+      const sc = data.serverControl;
+      const scTitle = document.createElement("h3");
+      scTitle.className = "cc-subtitle";
+      scTitle.textContent = "Server Control (EXT-X-SERVER-CONTROL)";
+      body.appendChild(scTitle);
+
+      const scGrid = document.createElement("div");
+      scGrid.className = "stat-grid";
+      if (sc.canBlockReload !== undefined) appendStatToGrid(scGrid, "CAN-BLOCK-RELOAD", sc.canBlockReload ? "YES" : "NO");
+      if (sc.canSkipUntil !== undefined) appendStatToGrid(scGrid, "CAN-SKIP-UNTIL", sc.canSkipUntil + "s");
+      if (sc.canSkipDateranges !== undefined) appendStatToGrid(scGrid, "CAN-SKIP-DATERANGES", sc.canSkipDateranges ? "YES" : "NO");
+      if (sc.holdBack !== undefined) appendStatToGrid(scGrid, "HOLD-BACK", sc.holdBack + "s");
+      if (sc.partHoldBack !== undefined) appendStatToGrid(scGrid, "PART-HOLD-BACK", sc.partHoldBack + "s");
+      body.appendChild(scGrid);
+    }
+
+    // Part Info
+    if (data.partInf) {
+      const piTitle = document.createElement("h3");
+      piTitle.className = "cc-subtitle";
+      piTitle.textContent = "Part Info (EXT-X-PART-INF)";
+      body.appendChild(piTitle);
+
+      const piGrid = document.createElement("div");
+      piGrid.className = "stat-grid";
+      if (data.partInf.partTarget !== null) appendStatToGrid(piGrid, "PART-TARGET", data.partInf.partTarget + "s");
+      body.appendChild(piGrid);
+    }
+
+    // Partial Segments summary
+    if (data.parts.length > 0) {
+      const partTitle = document.createElement("h3");
+      partTitle.className = "cc-subtitle";
+      partTitle.textContent = "Partial Segments (EXT-X-PART)";
+      body.appendChild(partTitle);
+
+      const partGrid = document.createElement("div");
+      partGrid.className = "stat-grid";
+      appendStatToGrid(partGrid, "Total Parts", data.parts.length);
+      const indParts = data.parts.filter(p => p.independent).length;
+      if (indParts > 0) appendStatToGrid(partGrid, "Independent Parts", indParts);
+      const gapParts = data.parts.filter(p => p.gap).length;
+      if (gapParts > 0) appendStatToGrid(partGrid, "Gap Parts", gapParts);
+      const partDurations = data.parts.filter(p => p.duration).map(p => p.duration);
+      if (partDurations.length > 0) {
+        const avgP = partDurations.reduce((a, b) => a + b, 0) / partDurations.length;
+        appendStatToGrid(partGrid, "Avg Part Duration", avgP.toFixed(3) + "s");
+        appendStatToGrid(partGrid, "Min Part Duration", Math.min(...partDurations).toFixed(3) + "s");
+        appendStatToGrid(partGrid, "Max Part Duration", Math.max(...partDurations).toFixed(3) + "s");
+      }
+      body.appendChild(partGrid);
+
+      // Collapsible parts table
+      const partsTableWrap = document.createElement("div");
+      partsTableWrap.className = "ll-parts-table-wrap";
+      const togglePartsBtn = document.createElement("button");
+      togglePartsBtn.className = "decode-toggle-btn";
+      togglePartsBtn.textContent = "📋 Show All Parts (" + data.parts.length + ")";
+      const partsTableDiv = document.createElement("div");
+      partsTableDiv.style.display = "none";
+
+      const pWrapper = document.createElement("div");
+      pWrapper.className = "variant-table-wrapper";
+      const pTable = document.createElement("table");
+      pTable.className = "variant-table segment-url-table";
+      const pThead = document.createElement("thead");
+      pThead.innerHTML = "<tr><th>#</th><th>Duration</th><th>Independent</th><th>URI</th></tr>";
+      pTable.appendChild(pThead);
+      const pTbody = document.createElement("tbody");
+      data.parts.forEach((part, i) => {
+        const tr = document.createElement("tr");
+        const tdIdx = document.createElement("td");
+        tdIdx.className = "seg-index";
+        tdIdx.textContent = i + 1;
+        tr.appendChild(tdIdx);
+        const tdDur = document.createElement("td");
+        tdDur.className = "table-bandwidth";
+        tdDur.textContent = part.duration ? part.duration.toFixed(3) + "s" : "—";
+        tr.appendChild(tdDur);
+        const tdInd = document.createElement("td");
+        tdInd.textContent = part.independent ? "✓" : "—";
+        tdInd.style.textAlign = "center";
+        tr.appendChild(tdInd);
+        const tdUri = document.createElement("td");
+        tdUri.className = "seg-url-cell";
+        const pathSpan = document.createElement("span");
+        pathSpan.className = "seg-raw-path";
+        pathSpan.textContent = part.rawUri || "—";
+        pathSpan.title = part.uri || "";
+        tdUri.appendChild(pathSpan);
+        tr.appendChild(tdUri);
+        pTbody.appendChild(tr);
+      });
+      pTable.appendChild(pTbody);
+      pWrapper.appendChild(pTable);
+      partsTableDiv.appendChild(pWrapper);
+
+      togglePartsBtn.addEventListener("click", () => {
+        const showing = partsTableDiv.style.display !== "none";
+        partsTableDiv.style.display = showing ? "none" : "block";
+        togglePartsBtn.textContent = showing
+          ? "📋 Show All Parts (" + data.parts.length + ")"
+          : "📋 Hide Parts";
+      });
+      partsTableWrap.appendChild(togglePartsBtn);
+      partsTableWrap.appendChild(partsTableDiv);
+      body.appendChild(partsTableWrap);
+    }
+
+    // Preload Hints
+    if (data.preloadHints.length > 0) {
+      const phTitle = document.createElement("h3");
+      phTitle.className = "cc-subtitle";
+      phTitle.textContent = "Preload Hints (EXT-X-PRELOAD-HINT)";
+      body.appendChild(phTitle);
+
+      data.preloadHints.forEach(hint => {
+        const item = document.createElement("div");
+        item.className = "track-item";
+
+        const typeBadge = document.createElement("span");
+        typeBadge.className = "track-type track-type-ll";
+        typeBadge.textContent = hint.type || "HINT";
+        item.appendChild(typeBadge);
+
+        const details = [];
+        if (hint.rawUri) details.push(hint.rawUri);
+        if (hint.byterangeStart !== undefined) details.push("Start: " + hint.byterangeStart);
+        if (hint.byterangeLength !== undefined) details.push("Length: " + hint.byterangeLength);
+
+        const detailDiv = document.createElement("div");
+        detailDiv.className = "track-details";
+        detailDiv.textContent = details.join(" · ");
+        item.appendChild(detailDiv);
+
+        body.appendChild(item);
+      });
+    }
+
+    // Skip
+    if (data.skip) {
+      const skipTitle = document.createElement("h3");
+      skipTitle.className = "cc-subtitle";
+      skipTitle.textContent = "Playlist Delta Updates (EXT-X-SKIP)";
+      body.appendChild(skipTitle);
+
+      const skipGrid = document.createElement("div");
+      skipGrid.className = "stat-grid";
+      appendStatToGrid(skipGrid, "Skipped Segments", data.skip.skippedSegments);
+      if (data.skip.recentlyRemovedDateranges) {
+        appendStatToGrid(skipGrid, "Removed DateRanges", data.skip.recentlyRemovedDateranges);
+      }
+      body.appendChild(skipGrid);
+    }
+
+    outputEl.appendChild(section);
   }
 
   // Segment Duration Chart
@@ -1571,6 +2296,8 @@ async function loadManifestFromUrl() {
     const text = await response.text();
     document.getElementById("manifestInput").value = text;
     addToHistory(url);
+    autoRefreshCount = 0;
+    lastManifestText = text;
     analyzeManifest(url);
   } catch (error) {
     console.error(error);
@@ -1627,9 +2354,11 @@ function analyzeManifest(baseUrl) {
     return;
   }
 
-  stopAutoRefresh();
+  const isAutoRefreshing = autoRefreshTimer !== null;
+  // Stop timer without resetting count during auto-refresh
+  if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
   const data = parseManifest(manifest, baseUrl);
-  renderRawManifest(manifest);
+  renderRawManifest(manifest, isAutoRefreshing);
   renderResults(data);
 
   // Auto-refresh for live media playlists loaded from URL
@@ -1638,6 +2367,11 @@ function analyzeManifest(baseUrl) {
       autoRefreshInterval = Math.max(2000, parseFloat(data.targetDuration) * 1000);
     }
     startAutoRefresh(baseUrl);
+  } else {
+    // Not live or no URL — fully stop
+    autoRefreshCount = 0;
+    const badge = document.getElementById("autoRefreshBadge");
+    if (badge) badge.style.display = "none";
   }
 }
 
@@ -1686,20 +2420,47 @@ function toggleRawViewer() {
 
 let autoRefreshTimer = null;
 let autoRefreshInterval = 5000;
+let autoRefreshCount = 0;
+let lastManifestText = "";
 
 function startAutoRefresh(url) {
-  stopAutoRefresh();
+  if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
   const badge = document.getElementById("autoRefreshBadge");
-  if (badge) badge.style.display = "inline-flex";
+  if (badge) {
+    badge.style.display = "inline-flex";
+    updateRefreshBadge();
+  }
   autoRefreshTimer = setInterval(async () => {
     try {
       const response = await fetch(url);
       if (!response.ok) return;
       const text = await response.text();
+      const changed = text !== lastManifestText;
+      autoRefreshCount++;
+      lastManifestText = text;
       document.getElementById("manifestInput").value = text;
       analyzeManifest(url);
-    } catch { /* silently skip failed refreshes */ }
+      updateRefreshBadge(changed);
+      const outputEl = document.getElementById("output");
+      outputEl.classList.remove("refresh-flash", "refresh-flash-subtle");
+      void outputEl.offsetWidth;
+      outputEl.classList.add(changed ? "refresh-flash" : "refresh-flash-subtle");
+      setTimeout(() => outputEl.classList.remove("refresh-flash", "refresh-flash-subtle"), 600);
+    } catch (err) {
+      console.warn("Auto-refresh failed:", err.message);
+    }
   }, autoRefreshInterval);
+}
+
+function updateRefreshBadge(changed) {
+  const badge = document.getElementById("autoRefreshBadge");
+  if (!badge) return;
+  const now = new Date();
+  const time = now.toLocaleTimeString();
+  const countText = autoRefreshCount > 0 ? " · #" + autoRefreshCount : "";
+  const timeText = autoRefreshCount > 0 ? " · " + time : "";
+  const changeText = autoRefreshCount > 0 ? (changed ? " · ✓ Updated" : " · ✓ Fetched") : "";
+  badge.innerHTML = '<span class="auto-refresh-dot"></span> LIVE' + countText + timeText + changeText;
 }
 
 function stopAutoRefresh() {
@@ -1707,6 +2468,7 @@ function stopAutoRefresh() {
     clearInterval(autoRefreshTimer);
     autoRefreshTimer = null;
   }
+  autoRefreshCount = 0;
   const badge = document.getElementById("autoRefreshBadge");
   if (badge) badge.style.display = "none";
 }
