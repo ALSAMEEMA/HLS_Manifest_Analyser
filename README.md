@@ -27,7 +27,24 @@ A browser-based HLS manifest (.m3u8) analyzer — inspect variants, audio tracks
 | `#EXT-X-START` | Preferred start offset |
 | `#EXT-X-INDEPENDENT-SEGMENTS` | Independent decode capability |
 | `#EXT-X-DISCONTINUITY` | Stream discontinuity markers |
+| `#EXT-X-SESSION-KEY` | Session-level DRM keys |
 | `#EXTINF` | Segment durations |
+
+### Low-Latency HLS (LL-HLS)
+| Tag | Details |
+|-----|---------|
+| `#EXT-X-SERVER-CONTROL` | CAN-BLOCK-RELOAD, CAN-SKIP-UNTIL, HOLD-BACK, PART-HOLD-BACK |
+| `#EXT-X-PART-INF` | PART-TARGET duration |
+| `#EXT-X-PART` | Partial segments with duration, URI, INDEPENDENT, GAP |
+| `#EXT-X-PRELOAD-HINT` | Preload hint type and URI |
+| `#EXT-X-SKIP` | Delta updates — skipped segments count |
+
+### DRM / PSSH Decoding
+- **Widevine** — PSSH box decoding with provider, content ID, key IDs
+- **PlayReady** — PRO header XML, license URL, key IDs, algorithm
+- **FairPlay, ClearKey** — system ID detection from KEYFORMAT
+- Base64 PSSH from key URI → decoded table with copy buttons
+- Session keys (`#EXT-X-SESSION-KEY`) support
 
 ### Codec Decoding
 Raw codec strings are decoded to human-readable names:
@@ -50,6 +67,8 @@ Raw codec strings are decoded to human-readable names:
 - 📋 Copy full segment URLs from media playlists
 - 💾 Export analysis as JSON
 - 🔄 Auto-refresh for live manifests (uses target duration interval)
+- Live badge with refresh counter and timestamp
+- Section expand/collapse states preserved during refresh
 - 🕑 URL history with localStorage persistence
 - 📱 Responsive design
 
