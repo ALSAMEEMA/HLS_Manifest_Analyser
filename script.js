@@ -51,7 +51,8 @@ function decodeCodec(codec) {
   if (c.startsWith("hvc1.") || c.startsWith("hev1.")) {
     const parts = c.split(".");
     const tier = parts[1] === "2" ? "Main 10" : "Main";
-    const level = parts[3] ? "L" + parts[3] : "";
+    const rawLevel = parts[3] || "";
+    const level = rawLevel ? (rawLevel.toUpperCase().startsWith("L") ? rawLevel.toUpperCase() : "L" + rawLevel) : "";
     return "H.265 " + tier + (level ? " " + level : "");
   }
   // AV1
@@ -468,7 +469,14 @@ function renderHistory() {
   history.forEach(url => {
     const btn = document.createElement("button");
     btn.className = "history-item";
-    btn.textContent = url;
+    // Show filename portion for readability
+    try {
+      const urlObj = new URL(url);
+      const pathParts = urlObj.pathname.split("/").filter(Boolean);
+      btn.textContent = pathParts.length > 0 ? pathParts[pathParts.length - 1] : url;
+    } catch {
+      btn.textContent = url.length > 40 ? "..." + url.slice(-37) : url;
+    }
     btn.title = url;
     btn.addEventListener("click", () => {
       document.getElementById("manifestUrl").value = url;
@@ -557,11 +565,17 @@ function parseManifest(manifest, baseUrl) {
     preloadHints: [],        // #EXT-X-PRELOAD-HINT entries
     skip: null,              // #EXT-X-SKIP
     isLowLatency: false,
+    // New features
+    dateRanges: [],          // #EXT-X-DATERANGE entries
+    sessionData: [],         // #EXT-X-SESSION-DATA entries
+    discontinuitySequence: null, // #EXT-X-DISCONTINUITY-SEQUENCE
+    gapCount: 0,             // #EXT-X-GAP count
     warnings: []
   };
 
   let currentExtInf = null;
   let currentByteRange = null;
+  let currentGap = false;
 
   lines.forEach((rawLine, index) => {
     const line = rawLine.trim();
@@ -597,6 +611,17 @@ function parseManifest(manifest, baseUrl) {
     // DISCONTINUITY
     if (line === "#EXT-X-DISCONTINUITY") {
       result.discontinuities++;
+    }
+
+    // DISCONTINUITY-SEQUENCE
+    if (line.startsWith("#EXT-X-DISCONTINUITY-SEQUENCE:")) {
+      result.discontinuitySequence = parseInt(line.split(":")[1].trim());
+    }
+
+    // GAP
+    if (line === "#EXT-X-GAP") {
+      result.gapCount++;
+      currentGap = true;
     }
 
     // ENCRYPTION
@@ -648,11 +673,13 @@ function parseManifest(manifest, baseUrl) {
       const forcedMatch = line.match(/FORCED=(YES|NO)/);
       const charsMatch = line.match(/CHARACTERISTICS="([^"]+)"/);
       const channelsMatch = line.match(/CHANNELS="([^"]+)"/);
+      const autoselectMatch = line.match(/AUTOSELECT=(YES|NO)/);
 
       if (typeMatch) track.type = typeMatch[1];
       if (nameMatch) track.name = nameMatch[1];
       if (langMatch) track.language = langMatch[1];
       if (defaultMatch) track.default = defaultMatch[1] === "YES";
+      if (autoselectMatch) track.autoselect = autoselectMatch[1] === "YES";
       if (groupMatch) track.groupId = groupMatch[1];
       if (uriMatch) track.uri = resolveUrl(baseUrl, uriMatch[1]);
       if (instreamMatch) track.instreamId = instreamMatch[1];
@@ -723,6 +750,26 @@ function parseManifest(manifest, baseUrl) {
       if (ccAttrMatch) {
         result.closedCaptionsAttr = ccAttrMatch[1] || ccAttrMatch[2];
       }
+
+      // AUDIO group reference
+      const audioGroupMatch = line.match(/AUDIO="([^"]+)"/);
+      if (audioGroupMatch) variant.audioGroup = audioGroupMatch[1];
+
+      // SUBTITLES group reference
+      const subsGroupMatch = line.match(/SUBTITLES="([^"]+)"/);
+      if (subsGroupMatch) variant.subtitlesGroup = subsGroupMatch[1];
+
+      // VIDEO group reference
+      const videoGroupMatch = line.match(/VIDEO="([^"]+)"/);
+      if (videoGroupMatch) variant.videoGroup = videoGroupMatch[1];
+
+      // HDCP-LEVEL
+      const hdcpMatch = line.match(/HDCP-LEVEL=([^,]+)/);
+      if (hdcpMatch) variant.hdcpLevel = hdcpMatch[1];
+
+      // VIDEO-RANGE (SDR, PQ, HLG)
+      const videoRangeMatch = line.match(/VIDEO-RANGE=([^,]+)/);
+      if (videoRangeMatch) variant.videoRange = videoRangeMatch[1];
 
       // CHILD PLAYLIST URL
       const nextLine = lines[index + 1];
@@ -877,6 +924,47 @@ function parseManifest(manifest, baseUrl) {
       };
     }
 
+    // EXT-X-DATERANGE (timed metadata / SCTE-35)
+    if (line.startsWith("#EXT-X-DATERANGE:")) {
+      const dr = {};
+      const drId = line.match(/ID="([^"]+)"/);
+      const drClass = line.match(/CLASS="([^"]+)"/);
+      const drStart = line.match(/START-DATE="([^"]+)"/);
+      const drEnd = line.match(/END-DATE="([^"]+)"/);
+      const drDur = line.match(/DURATION=([\d.]+)/);
+      const drPlanned = line.match(/PLANNED-DURATION=([\d.]+)/);
+      const drScte35Out = line.match(/SCTE35-OUT=0x([0-9a-fA-F]+)/i);
+      const drScte35In = line.match(/SCTE35-IN=0x([0-9a-fA-F]+)/i);
+      const drScte35Cmd = line.match(/SCTE35-CMD=0x([0-9a-fA-F]+)/i);
+      const drEndOnNext = line.match(/END-ON-NEXT=(YES|NO)/);
+      if (drId) dr.id = drId[1];
+      if (drClass) dr.class = drClass[1];
+      if (drStart) dr.startDate = drStart[1];
+      if (drEnd) dr.endDate = drEnd[1];
+      if (drDur) dr.duration = parseFloat(drDur[1]);
+      if (drPlanned) dr.plannedDuration = parseFloat(drPlanned[1]);
+      if (drScte35Out) dr.scte35Out = drScte35Out[1];
+      if (drScte35In) dr.scte35In = drScte35In[1];
+      if (drScte35Cmd) dr.scte35Cmd = drScte35Cmd[1];
+      if (drEndOnNext) dr.endOnNext = drEndOnNext[1] === "YES";
+      dr.raw = line;
+      result.dateRanges.push(dr);
+    }
+
+    // EXT-X-SESSION-DATA (master playlist)
+    if (line.startsWith("#EXT-X-SESSION-DATA:")) {
+      const sd = {};
+      const sdId = line.match(/DATA-ID="([^"]+)"/);
+      const sdValue = line.match(/VALUE="([^"]+)"/);
+      const sdUri = line.match(/URI="([^"]+)"/);
+      const sdLang = line.match(/LANGUAGE="([^"]+)"/);
+      if (sdId) sd.dataId = sdId[1];
+      if (sdValue) sd.value = sdValue[1];
+      if (sdUri) sd.uri = sdUri[1];
+      if (sdLang) sd.language = sdLang[1];
+      result.sessionData.push(sd);
+    }
+
     // EXTINF (segment duration)
     if (line.startsWith("#EXTINF:")) {
       const durationMatch = line.match(/#EXTINF:([\d.]+)/);
@@ -908,7 +996,8 @@ function parseManifest(manifest, baseUrl) {
           url: resolvedSegUrl,
           rawPath: line,
           duration: currentExtInf,
-          byteRange: currentByteRange || null
+          byteRange: currentByteRange || null,
+          gap: currentGap
         });
         if (currentByteRange) {
           result.byteRanges.push({ segment: result.segments, range: currentByteRange });
@@ -930,6 +1019,7 @@ function parseManifest(manifest, baseUrl) {
       }
       currentExtInf = null;
       currentByteRange = null;
+      currentGap = false;
     }
   });
 
@@ -1236,8 +1326,19 @@ function renderVariantTable(parent, variants, onLoadClick) {
   const table = document.createElement("table");
   table.className = "variant-table";
 
+  // Detect which optional columns have data
+  const hasHdcp = variants.some(v => v.raw && /HDCP-LEVEL=/.test(v.raw));
+  const hasVideoRange = variants.some(v => v.raw && /VIDEO-RANGE=/.test(v.raw));
+  const hasSubs = variants.some(v => v.raw && /SUBTITLES="/.test(v.raw));
+
+  let headerHtml = "<tr><th>Resolution</th><th>Bandwidth</th><th>Codecs</th><th>Audio</th>";
+  if (hasSubs) headerHtml += "<th>Subtitles</th>";
+  if (hasVideoRange) headerHtml += "<th>Video Range</th>";
+  if (hasHdcp) headerHtml += "<th>HDCP</th>";
+  headerHtml += "<th>Action</th></tr>";
+
   const thead = document.createElement("thead");
-  thead.innerHTML = "<tr><th>Resolution</th><th>Bandwidth</th><th>Codecs</th><th>Audio</th><th>Action</th></tr>";
+  thead.innerHTML = headerHtml;
   table.appendChild(thead);
 
   const tbody = document.createElement("tbody");
@@ -1253,10 +1354,15 @@ function renderVariantTable(parent, variants, onLoadClick) {
     tr.appendChild(tdBw);
 
     const tdCodec = document.createElement("td");
-    const codecSpan = document.createElement("span");
-    codecSpan.className = "table-codec";
-    codecSpan.textContent = v.codecs || "—";
-    tdCodec.appendChild(codecSpan);
+    if (v.codecs) {
+      const decoded = v.codecs.split(",").map(c => decodeCodec(c.trim())).join(", ");
+      const codecSpan = document.createElement("span");
+      codecSpan.className = "table-codec";
+      codecSpan.textContent = decoded !== v.codecs ? v.codecs + " (" + decoded + ")" : v.codecs;
+      tdCodec.appendChild(codecSpan);
+    } else {
+      tdCodec.textContent = "—";
+    }
     tr.appendChild(tdCodec);
 
     const tdAudio = document.createElement("td");
@@ -1264,6 +1370,27 @@ function renderVariantTable(parent, variants, onLoadClick) {
     const audioMatch = v.raw ? v.raw.match(/AUDIO="([^"]+)"/) : null;
     tdAudio.textContent = audioMatch ? audioMatch[1] : "—";
     tr.appendChild(tdAudio);
+
+    if (hasSubs) {
+      const tdSubs = document.createElement("td");
+      const subsMatch = v.raw ? v.raw.match(/SUBTITLES="([^"]+)"/) : null;
+      tdSubs.textContent = subsMatch ? subsMatch[1] : "—";
+      tr.appendChild(tdSubs);
+    }
+
+    if (hasVideoRange) {
+      const tdVr = document.createElement("td");
+      const vrMatch = v.raw ? v.raw.match(/VIDEO-RANGE=([^,]+)/) : null;
+      tdVr.textContent = vrMatch ? vrMatch[1] : "—";
+      tr.appendChild(tdVr);
+    }
+
+    if (hasHdcp) {
+      const tdHdcp = document.createElement("td");
+      const hdcpMatch = v.raw ? v.raw.match(/HDCP-LEVEL=([^,]+)/) : null;
+      tdHdcp.textContent = hdcpMatch ? hdcpMatch[1] : "—";
+      tr.appendChild(tdHdcp);
+    }
 
     const tdAction = document.createElement("td");
     createTableActions(tdAction, v.url, "VIDEO", onLoadClick);
@@ -1282,7 +1409,7 @@ function renderAudioTable(parent, tracks, onLoadClick) {
   table.className = "variant-table";
 
   const thead = document.createElement("thead");
-  thead.innerHTML = "<tr><th>Name</th><th>Language</th><th>Group</th><th>Channels</th><th>Default</th><th>Action</th></tr>";
+  thead.innerHTML = "<tr><th>Name</th><th>Language</th><th>Group</th><th>Channels</th><th>Default</th><th>Autoselect</th><th>Action</th></tr>";
   table.appendChild(thead);
 
   const tbody = document.createElement("tbody");
@@ -1308,6 +1435,10 @@ function renderAudioTable(parent, tracks, onLoadClick) {
     const tdDef = document.createElement("td");
     tdDef.textContent = t.default ? "Yes" : "No";
     tr.appendChild(tdDef);
+
+    const tdAuto = document.createElement("td");
+    tdAuto.textContent = t.autoselect !== undefined ? (t.autoselect ? "Yes" : "No") : "—";
+    tr.appendChild(tdAuto);
 
     const tdAction = document.createElement("td");
     createTableActions(tdAction, t.uri, "AUDIO", onLoadClick);
@@ -1395,6 +1526,22 @@ function renderResults(data) {
   // Store data for export
   window._lastAnalysis = data;
 
+  // Back navigation button
+  if (navStack.length > 0) {
+    const backBar = document.createElement("div");
+    backBar.className = "nav-back-bar";
+    const backBtn = document.createElement("button");
+    backBtn.className = "nav-back-btn";
+    backBtn.textContent = "← Back to Master";
+    backBtn.addEventListener("click", goBackNav);
+    backBar.appendChild(backBtn);
+    const breadcrumb = document.createElement("span");
+    breadcrumb.className = "nav-breadcrumb";
+    breadcrumb.textContent = navStack.length === 1 ? "Master → Media" : "Master → ... → Media (depth " + navStack.length + ")";
+    backBar.appendChild(breadcrumb);
+    outputEl.appendChild(backBar);
+  }
+
   // PLAYLIST TYPE + STREAM TYPE
   let typeLabel = escapeHtml(data.playlistType);
   if (data.streamType) {
@@ -1413,6 +1560,19 @@ function renderResults(data) {
 
   if (data.version) {
     appendStat(outputEl, "HLS Version", escapeHtml(data.version));
+  }
+
+  // WARNINGS — show near top for visibility
+  if (data.warnings.length > 0) {
+    const { section, body } = createCollapsibleSection("Warnings", data.warnings.length, false);
+    section.classList.add("warning-section");
+    data.warnings.forEach(w => {
+      const wDiv = document.createElement("div");
+      wDiv.className = "warning-item";
+      wDiv.textContent = "⚠ " + w;
+      body.appendChild(wDiv);
+    });
+    outputEl.appendChild(section);
   }
 
   // MASTER PLAYLIST
@@ -1607,6 +1767,8 @@ function renderResults(data) {
     if (data.mediaSequence !== null) appendStatToGrid(grid, "Media Sequence", data.mediaSequence);
     if (data.totalDuration > 0) appendStatToGrid(grid, "Total Duration", formatDuration(data.totalDuration));
     if (data.discontinuities > 0) appendStatToGrid(grid, "Discontinuities", data.discontinuities);
+    if (data.discontinuitySequence !== null) appendStatToGrid(grid, "Discontinuity Sequence", data.discontinuitySequence);
+    if (data.gapCount > 0) appendStatToGrid(grid, "Gap Segments", data.gapCount);
     outputEl.appendChild(grid);
 
     // Segment duration stats
@@ -1835,11 +1997,15 @@ function renderResults(data) {
         (data.encryption.uri ? " — Key URI: " + escapeHtml(data.encryption.uri) : ""));
     }
 
-    // Segment URLs table
+    // Segment URLs table with pagination
     if (data.segmentUrls.length > 0) {
       const { section, body } = createCollapsibleSection(
         "Segment URLs", data.segmentUrls.length, data.segmentUrls.length > 20
       );
+
+      const PAGE_SIZE = 100;
+      let currentPage = 0;
+      const totalPages = Math.ceil(data.segmentUrls.length / PAGE_SIZE);
 
       const wrapper = document.createElement("div");
       wrapper.className = "variant-table-wrapper";
@@ -1847,53 +2013,106 @@ function renderResults(data) {
       const table = document.createElement("table");
       table.className = "variant-table segment-url-table";
 
+      const hasGaps = data.gapCount > 0;
       const thead = document.createElement("thead");
-      thead.innerHTML = "<tr><th>#</th><th>Duration</th><th>URL / Path</th><th>Action</th></tr>";
+      thead.innerHTML = "<tr><th>#</th><th>Duration</th>" + (hasGaps ? "<th>Gap</th>" : "") + "<th>URL / Path</th><th>Action</th></tr>";
       table.appendChild(thead);
 
       const tbody = document.createElement("tbody");
-      data.segmentUrls.forEach(seg => {
-        const tr = document.createElement("tr");
-
-        const tdIdx = document.createElement("td");
-        tdIdx.className = "seg-index";
-        tdIdx.textContent = seg.index;
-        tr.appendChild(tdIdx);
-
-        const tdDur = document.createElement("td");
-        tdDur.className = "table-bandwidth";
-        tdDur.textContent = seg.duration !== null ? seg.duration.toFixed(3) + "s" : "—";
-        tr.appendChild(tdDur);
-
-        const tdUrl = document.createElement("td");
-        tdUrl.className = "seg-url-cell";
-        const pathSpan = document.createElement("span");
-        pathSpan.className = "seg-raw-path";
-        pathSpan.textContent = seg.rawPath;
-        pathSpan.title = seg.url;
-        tdUrl.appendChild(pathSpan);
-        tr.appendChild(tdUrl);
-
-        const tdAction = document.createElement("td");
-        const copyBtn = document.createElement("button");
-        copyBtn.className = "table-load-btn";
-        copyBtn.textContent = "Copy URL";
-        copyBtn.addEventListener("click", (e) => {
-          e.stopPropagation();
-          navigator.clipboard.writeText(seg.url).then(() => {
-            copyBtn.textContent = "Copied!";
-            setTimeout(() => { copyBtn.textContent = "Copy URL"; }, 1500);
-          });
-        });
-        tdAction.appendChild(copyBtn);
-        tr.appendChild(tdAction);
-
-        tbody.appendChild(tr);
-      });
-
       table.appendChild(tbody);
       wrapper.appendChild(table);
       body.appendChild(wrapper);
+
+      function renderSegmentPage(page) {
+        tbody.innerHTML = "";
+        const start = page * PAGE_SIZE;
+        const end = Math.min(start + PAGE_SIZE, data.segmentUrls.length);
+        for (let si = start; si < end; si++) {
+          const seg = data.segmentUrls[si];
+          const tr = document.createElement("tr");
+          if (seg.gap) tr.className = "seg-gap-row";
+
+          const tdIdx = document.createElement("td");
+          tdIdx.className = "seg-index";
+          tdIdx.textContent = seg.index;
+          tr.appendChild(tdIdx);
+
+          const tdDur = document.createElement("td");
+          tdDur.className = "table-bandwidth";
+          tdDur.textContent = seg.duration !== null ? seg.duration.toFixed(3) + "s" : "—";
+          tr.appendChild(tdDur);
+
+          if (hasGaps) {
+            const tdGap = document.createElement("td");
+            tdGap.textContent = seg.gap ? "⚠ GAP" : "";
+            tdGap.style.color = seg.gap ? "var(--color-warning, #f59e0b)" : "";
+            tr.appendChild(tdGap);
+          }
+
+          const tdUrl = document.createElement("td");
+          tdUrl.className = "seg-url-cell";
+          const pathSpan = document.createElement("span");
+          pathSpan.className = "seg-raw-path";
+          pathSpan.textContent = seg.rawPath;
+          pathSpan.title = seg.url;
+          tdUrl.appendChild(pathSpan);
+          tr.appendChild(tdUrl);
+
+          const tdAction = document.createElement("td");
+          const copyBtn = document.createElement("button");
+          copyBtn.className = "table-load-btn";
+          copyBtn.textContent = "Copy URL";
+          copyBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            navigator.clipboard.writeText(seg.url).then(() => {
+              copyBtn.textContent = "Copied!";
+              setTimeout(() => { copyBtn.textContent = "Copy URL"; }, 1500);
+            });
+          });
+          tdAction.appendChild(copyBtn);
+          tr.appendChild(tdAction);
+
+          tbody.appendChild(tr);
+        }
+        if (pageInfo) pageInfo.textContent = "Showing " + (start + 1) + "–" + end + " of " + data.segmentUrls.length;
+      }
+
+      // Pagination controls (only if needed)
+      let pageInfo = null;
+      if (totalPages > 1) {
+        const pagDiv = document.createElement("div");
+        pagDiv.className = "seg-pagination";
+
+        const prevBtn = document.createElement("button");
+        prevBtn.className = "table-load-btn";
+        prevBtn.textContent = "◀ Prev";
+        prevBtn.addEventListener("click", () => {
+          if (currentPage > 0) { currentPage--; renderSegmentPage(currentPage); updatePagBtns(); }
+        });
+        pagDiv.appendChild(prevBtn);
+
+        pageInfo = document.createElement("span");
+        pageInfo.className = "seg-page-info";
+        pagDiv.appendChild(pageInfo);
+
+        const nextBtn = document.createElement("button");
+        nextBtn.className = "table-load-btn";
+        nextBtn.textContent = "Next ▶";
+        nextBtn.addEventListener("click", () => {
+          if (currentPage < totalPages - 1) { currentPage++; renderSegmentPage(currentPage); updatePagBtns(); }
+        });
+        pagDiv.appendChild(nextBtn);
+
+        function updatePagBtns() {
+          prevBtn.disabled = currentPage === 0;
+          nextBtn.disabled = currentPage >= totalPages - 1;
+        }
+
+        body.appendChild(pagDiv);
+        updatePagBtns();
+      }
+
+      renderSegmentPage(0);
 
       // Copy All URLs button
       const copyAllDiv = document.createElement("div");
@@ -2149,16 +2368,94 @@ function renderResults(data) {
     });
   }
 
-  // Validation Warnings
-  if (data.warnings.length > 0) {
-    const { section, body } = createCollapsibleSection("Warnings", data.warnings.length, false);
-    section.classList.add("warning-section");
-    data.warnings.forEach(w => {
-      const wDiv = document.createElement("div");
-      wDiv.className = "warning-item";
-      wDiv.textContent = "⚠ " + w;
-      body.appendChild(wDiv);
+  // DateRanges (timed metadata / SCTE-35)
+  if (data.dateRanges.length > 0) {
+    const { section, body } = createCollapsibleSection(
+      "Timed Metadata (EXT-X-DATERANGE)", data.dateRanges.length, false
+    );
+
+    const drWrapper = document.createElement("div");
+    drWrapper.className = "variant-table-wrapper";
+    const drTable = document.createElement("table");
+    drTable.className = "variant-table";
+    const drThead = document.createElement("thead");
+    drThead.innerHTML = "<tr><th>ID</th><th>Start Date</th><th>Duration</th><th>SCTE-35</th><th>Class</th></tr>";
+    drTable.appendChild(drThead);
+    const drTbody = document.createElement("tbody");
+    data.dateRanges.forEach(dr => {
+      const tr = document.createElement("tr");
+
+      const tdId = document.createElement("td");
+      tdId.textContent = dr.id || "—";
+      tr.appendChild(tdId);
+
+      const tdStart = document.createElement("td");
+      tdStart.textContent = dr.startDate || "—";
+      tr.appendChild(tdStart);
+
+      const tdDur = document.createElement("td");
+      tdDur.textContent = dr.duration ? dr.duration + "s" : (dr.plannedDuration ? dr.plannedDuration + "s (planned)" : "—");
+      tr.appendChild(tdDur);
+
+      const tdScte = document.createElement("td");
+      if (dr.scte35Out) {
+        tdScte.innerHTML = '<span class="badge badge-live" style="font-size:10px">OUT</span>';
+      } else if (dr.scte35In) {
+        tdScte.innerHTML = '<span class="badge badge-vod" style="font-size:10px">IN</span>';
+      } else if (dr.scte35Cmd) {
+        tdScte.innerHTML = '<span class="badge badge-event" style="font-size:10px">CMD</span>';
+      } else {
+        tdScte.textContent = "—";
+      }
+      tr.appendChild(tdScte);
+
+      const tdClass = document.createElement("td");
+      tdClass.textContent = dr.class || "—";
+      tr.appendChild(tdClass);
+
+      drTbody.appendChild(tr);
     });
+    drTable.appendChild(drTbody);
+    drWrapper.appendChild(drTable);
+    body.appendChild(drWrapper);
+
+    outputEl.appendChild(section);
+  }
+
+  // Session Data (EXT-X-SESSION-DATA)
+  if (data.sessionData.length > 0) {
+    const { section, body } = createCollapsibleSection(
+      "Session Data (EXT-X-SESSION-DATA)", data.sessionData.length, false
+    );
+
+    const sdWrapper = document.createElement("div");
+    sdWrapper.className = "variant-table-wrapper";
+    const sdTable = document.createElement("table");
+    sdTable.className = "variant-table";
+    const sdThead = document.createElement("thead");
+    sdThead.innerHTML = "<tr><th>DATA-ID</th><th>Value</th><th>Language</th><th>URI</th></tr>";
+    sdTable.appendChild(sdThead);
+    const sdTbody = document.createElement("tbody");
+    data.sessionData.forEach(sd => {
+      const tr = document.createElement("tr");
+      const tdId = document.createElement("td");
+      tdId.textContent = sd.dataId || "—";
+      tr.appendChild(tdId);
+      const tdVal = document.createElement("td");
+      tdVal.textContent = sd.value || "—";
+      tr.appendChild(tdVal);
+      const tdLang = document.createElement("td");
+      tdLang.textContent = sd.language || "—";
+      tr.appendChild(tdLang);
+      const tdUri = document.createElement("td");
+      tdUri.textContent = sd.uri || "—";
+      tr.appendChild(tdUri);
+      sdTbody.appendChild(tr);
+    });
+    sdTable.appendChild(sdTbody);
+    sdWrapper.appendChild(sdTable);
+    body.appendChild(sdWrapper);
+
     outputEl.appendChild(section);
   }
 }
@@ -2285,6 +2582,8 @@ async function loadManifestFromUrl() {
     return;
   }
 
+  // Clear nav stack when loading fresh URL
+  navStack.length = 0;
   showLoading(true);
 
   try {
@@ -2311,6 +2610,13 @@ async function loadChildPlaylist(url, trackType) {
   clearError();
   showLoading(true);
 
+  // Save current state to nav stack before navigating
+  const currentManifest = document.getElementById("manifestInput").value;
+  const currentUrl = document.getElementById("manifestUrl").value;
+  if (currentManifest.trim()) {
+    navStack.push({ manifest: currentManifest, url: currentUrl });
+  }
+
   // Map track type for display in media playlist
   if (trackType) {
     const typeMap = { "VIDEO": "Video", "AUDIO": "Audio", "SUBTITLES": "Subtitle", "CLOSED-CAPTIONS": "Closed Captions" };
@@ -2321,6 +2627,7 @@ async function loadChildPlaylist(url, trackType) {
     const response = await fetch(url);
     if (!response.ok) {
       showError(getHttpErrorMessage(response.status, response.statusText) + "\n\nURL: " + url);
+      navStack.pop(); // Restore stack on failure
       return;
     }
     const text = await response.text();
@@ -2332,12 +2639,23 @@ async function loadChildPlaylist(url, trackType) {
   } catch (error) {
     console.error(error);
     showError(getFetchErrorMessage(error) + "\n\nURL: " + url);
+    navStack.pop(); // Restore stack on failure
   } finally {
     showLoading(false);
     if (!document.getElementById("manifestInput").value) {
       window._lastLoadedTrackType = null;
     }
   }
+}
+
+function goBackNav() {
+  if (navStack.length === 0) return;
+  stopAutoRefresh();
+  const prev = navStack.pop();
+  document.getElementById("manifestInput").value = prev.manifest;
+  document.getElementById("manifestUrl").value = prev.url;
+  analyzeManifest(prev.url);
+  window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
 function analyzeManifest(baseUrl) {
@@ -2361,14 +2679,15 @@ function analyzeManifest(baseUrl) {
   renderRawManifest(manifest, isAutoRefreshing);
   renderResults(data);
 
-  // Auto-refresh for live media playlists loaded from URL
-  if (data.streamType === "LIVE" && baseUrl && isValidUrl(baseUrl)) {
+  // Auto-refresh for live/event media playlists loaded from URL
+  if ((data.streamType === "LIVE" || data.streamType === "EVENT") && baseUrl && isValidUrl(baseUrl)) {
     if (data.targetDuration) {
       autoRefreshInterval = Math.max(2000, parseFloat(data.targetDuration) * 1000);
     }
+    autoRefreshStreamType = data.streamType;
     startAutoRefresh(baseUrl);
   } else {
-    // Not live or no URL — fully stop
+    // Not live/event or no URL — fully stop
     autoRefreshCount = 0;
     const badge = document.getElementById("autoRefreshBadge");
     if (badge) badge.style.display = "none";
@@ -2423,6 +2742,10 @@ let autoRefreshInterval = 5000;
 let autoRefreshCount = 0;
 let lastManifestText = "";
 
+// Navigation stack for back button
+const navStack = [];
+let autoRefreshStreamType = "LIVE";
+
 function startAutoRefresh(url) {
   if (autoRefreshTimer) { clearInterval(autoRefreshTimer); autoRefreshTimer = null; }
   const badge = document.getElementById("autoRefreshBadge");
@@ -2460,7 +2783,7 @@ function updateRefreshBadge(changed) {
   const countText = autoRefreshCount > 0 ? " · #" + autoRefreshCount : "";
   const timeText = autoRefreshCount > 0 ? " · " + time : "";
   const changeText = autoRefreshCount > 0 ? (changed ? " · ✓ Updated" : " · ✓ Fetched") : "";
-  badge.innerHTML = '<span class="auto-refresh-dot"></span> LIVE' + countText + timeText + changeText;
+  badge.innerHTML = '<span class="auto-refresh-dot"></span> ' + autoRefreshStreamType + countText + timeText + changeText;
 }
 
 function stopAutoRefresh() {
@@ -2492,7 +2815,16 @@ document.addEventListener("DOMContentLoaded", () => {
 
   // Buttons
   document.getElementById("loadUrlBtn").addEventListener("click", loadManifestFromUrl);
-  document.getElementById("analyzeBtn").addEventListener("click", () => analyzeManifest());
+  document.getElementById("analyzeBtn").addEventListener("click", () => {
+    // Clear URL when analyzing pasted content to avoid wrong base URL
+    const urlInput = document.getElementById("manifestUrl");
+    const manifestInput = document.getElementById("manifestInput");
+    if (manifestInput.value.trim() && !urlInput.value.trim()) {
+      // Pasted content with no URL — fine
+    }
+    navStack.length = 0;
+    analyzeManifest();
+  });
   document.getElementById("themeToggle").addEventListener("click", toggleTheme);
   document.getElementById("copyRawBtn").addEventListener("click", copyRawManifest);
   document.getElementById("toggleRawBtn").addEventListener("click", toggleRawViewer);
